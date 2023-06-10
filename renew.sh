@@ -6,10 +6,10 @@
 DOMAIN=$(hostname -f)
 LOCALDIR=$(dirname "$(readlink -f "$0")")
 LOCALSCRIPT=$(basename "$0")
-
+NOW=$(date +"%s")
 ACMEDIR="$LOCALDIR/.well-known/acme-challenge"
 DIRECTORY_URL="https://acme-v02.api.letsencrypt.org/directory"
-SSL_CERT_FILE="$LOCALDIR/ca-certificates.crt"
+SSL_CERT_BASE64=$(openssl enc -base64 -e -in "$LOCALDIR/ca-certificates.crt" )
 RENEW_DAYS=30
 
 ACCOUNTKEY="esxi_account.key"
@@ -18,6 +18,7 @@ CSR="esxi.csr"
 CRT="esxi.crt"
 VMWARE_CRT="/etc/vmware/ssl/rui.crt"
 VMWARE_KEY="/etc/vmware/ssl/rui.key"
+CRON_SCHEDULE="0    0    *   *   0"
 
 if [ -r "$LOCALDIR/renew.cfg" ]; then
   . "$LOCALDIR/renew.cfg"
@@ -27,40 +28,53 @@ log() {
    echo "$@"
    logger -p daemon.info -t "$0" "$@"
 }
+echo "$SSL_CERT_BASE64" | openssl enc -base64 -d > /tmp/"$NOW"_CA.pem
+SSL_CERT_FILE="/tmp/${NOW}_CA.pem"
 
 log "Starting certificate renewal.";
 
 # Preparation steps
 if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "${DOMAIN/.}" ]; then
   log "Error: Hostname ${DOMAIN} is no FQDN."
+  # cleaning up
+  rm "$SSL_CERT_FILE"
   exit
 fi
 
-# Add a cronjob for auto renewal. The script is run once a week on Sunday at 00:00
-if ! grep -q "$LOCALDIR/$LOCALSCRIPT" /var/spool/cron/crontabs/root; then
+# Add a cronjob for auto renewal.
+set -f
+if ! grep -q "$CRON_SCHEDULE   /bin/sh $LOCALDIR/$LOCALSCRIPT" /var/spool/cron/crontabs/root; then
+  set +f
   kill -sighup "$(pidof crond)" 2>/dev/null
-  echo "0    0    *   *   0   /bin/sh $LOCALDIR/$LOCALSCRIPT" >> /var/spool/cron/crontabs/root
+  #check if we changed the cronjob - let's not have duplicates.
+  if grep -q "$LOCALSCRIPT" /var/spool/cron/crontabs/root; then
+    sed -i "/${LOCALSCRIPT}/d" /var/spool/cron/crontabs/root
+  fi
+  echo "$CRON_SCHEDULE   /bin/sh $LOCALDIR/$LOCALSCRIPT" >> /var/spool/cron/crontabs/root
   crond
+else
+  set +f
 fi
-
 # Check issuer and expiration date of existing cert
 if [ -e "$VMWARE_CRT" ]; then
   # If the cert is issued for a different hostname, request a new one
   SAN=$(openssl x509 -in "$VMWARE_CRT" -text -noout | grep DNS: | sed 's/DNS://g' | xargs)
   if [ "$SAN" != "$DOMAIN" ] ; then
     log "Existing cert issued for ${SAN} but current domain name is ${DOMAIN}. Requesting a new one!"
-  # If the cert is issued by Let's Encrypt, check its expiration date, otherwise request a new one
-  elif openssl x509 -in "$VMWARE_CRT" -issuer -noout | grep -q "O=Let's Encrypt"; then
+  # If the cert is issued by the trusted CA, check its expiration date, otherwise request a new one
+  elif openssl verify -CAfile "$SSL_CERT_FILE" -untrusted "$VMWARE_CRT" "$VMWARE_CRT"; then
     CERT_VALID=$(openssl x509 -enddate -noout -in "$VMWARE_CRT" | cut -d= -f2-)
-    log "Existing Let's Encrypt cert valid until: ${CERT_VALID}"
+    log "Existing valid cert until: ${CERT_VALID}"
     if openssl x509 -checkend $((RENEW_DAYS * 86400)) -noout -in "$VMWARE_CRT"; then
       log "=> Longer than ${RENEW_DAYS} days. Aborting."
+      #cleaning up
+      rm "$SSL_CERT_FILE"
       exit
     else
       log "=> Less than ${RENEW_DAYS} days. Renewing!"
     fi
   else
-    log "Existing cert for ${DOMAIN} not issued by Let's Encrypt. Requesting a new one!"
+    log "Existing cert for ${DOMAIN} not issued by the proper CA. Requesting a new one!"
   fi
 fi
 
@@ -97,12 +111,15 @@ if [ -n "$CERT" ] ; then
   # Provide the certificate to ESXi
   cp -p "$LOCALDIR/$KEY" "$VMWARE_KEY"
   cp -p "$LOCALDIR/$CRT" "$VMWARE_CRT"
-  log "Success: Obtained and installed a certificate from Let's Encrypt."
+  log "Success: Obtained and installed a certificate from $DIRECTORY_URL."
 elif openssl x509 -checkend 86400 -noout -in "$VMWARE_CRT"; then
-  log "Warning: No cert obtained from Let's Encrypt. Keeping the existing one as it is still valid."
+  log "Warning: No cert obtained from $DIRECTORY_URL. Keeping the existing one as it is still valid."
 else
-  log "Error: No cert obtained from Let's Encrypt. Generating a self-signed certificate."
+  log "Error: No cert obtained from $DIRECTORY_URL. Generating a self-signed certificate."
   /sbin/generate-certificates
 fi
+
+#cleanup temp files
+rm "$SSL_CERT_FILE"
 
 for s in /etc/init.d/*; do if $s | grep ssl_reset > /dev/null; then $s ssl_reset; fi; done
